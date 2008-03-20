@@ -7,9 +7,9 @@
 # This module was supported by the Ministry of Internal Affairs and 
 # Communications of Japan.
 #
-# Flow.pm - 2007/11/28
+# Flow.pm - 2008/03/18
 #
-# Copyright (c) 2007 NTT Information Sharing Platform Laboratories
+# Copyright (c) 2007-2008 NTT Information Sharing Platform Laboratories
 #
 # This package is free software and is provided "as is" without express
 # or implied warranty.  It may be used, redistributed and/or modified
@@ -26,18 +26,22 @@ use warnings;
 use Exporter;
 
 our @EXPORT_OK = qw(decode encode);
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 use constant NetFlowv5                        => 5 ;
 use constant NetFlowv8                        => 8 ;
 use constant NetFlowv9                        => 9 ;
 use constant IPFIX                            => 10 ;
  
-use constant DataTemplateSetId                => 0 ;
-use constant OptionTemplateSetId              => 1 ;
-use constant WithdrawDataTemplateSetId        => 2 ;
-use constant WithdrawOptionTemplateSetId      => 3 ;
-use constant MinDataTemplateSetId             => 256 ;
+use constant NFWV9_DataTemplateSetId          => 0 ;
+use constant NFWV9_OptionTemplateSetId        => 1 ;
+
+use constant IPFIX_DataTemplateSetId          => 2 ;
+use constant IPFIX_OptionTemplateSetId        => 3 ;
+
+use constant MinDataSetId                     => 256 ;
+use constant VariableLength                   => 65535 ;
+use constant ShortVariableLength              => 255 ;
 
 my %TemplateForNetFlowv5 = (
 		    'SetId'     => 0,
@@ -76,6 +80,7 @@ sub encode {
   my %FlowSetPayloads = () ;
   my %FlowSetLength = () ;
   my $FlowCount = 0 ;
+  my $DataCount = 0 ;
   my $HeaderLength = undef ;
   my $FlowSetHeaderLength = 4 ;
   my @Errors = ();
@@ -113,10 +118,10 @@ sub encode {
       }
 
       #
-      # pack flow data
+      # encode flow data
       # 
 
-      if( $FlowRef->{SetId} >= MinDataTemplateSetId ){
+      if( $FlowRef->{SetId} >= MinDataSetId ){
 
 	  # 
       	  # searching for particular template
@@ -144,7 +149,7 @@ sub encode {
 	  }
 
       #
-      # pack template data 
+      # encode template data 
       # 
 
       }else{
@@ -152,7 +157,7 @@ sub encode {
 	  ($PackRef,$ErrorRef) =
 	      &template_encode(
 		$FlowRef,
-		$HeaderRef	       
+		$HeaderRef
 		) ;
 
       }
@@ -200,21 +205,22 @@ sub encode {
 
       if( (length($FlowPackRef->{Pack})+$TotalLength) > $MaxDatagram ){
 
-	  #
-	  # make NetFlow datagram
-	  #
-
 	  if( $FlowCount > 0 ){
 
-	      push( 
-		    @Payloads,
-		    &datagram_encode(
-				     $HeaderRef,
-				     \%FlowSetPayloads,
-				     \$FlowCount,
-				     $#Payloads+1
-				     )
-		    ) ;
+	    #
+	    # make NetFlow/IPFIX datagram
+	    #
+
+	    push( 
+		 @Payloads,
+		 &datagram_encode(
+				  $HeaderRef,
+				  \%FlowSetPayloads,
+				  \$FlowCount,
+				  $#Payloads+1,
+				  \$DataCount
+				 )
+		) ;
 
 	  }else{
 
@@ -231,6 +237,7 @@ sub encode {
 	  %FlowSetPayloads = () ;
 	  %FlowSetLength = () ;
 	  $FlowCount = 0 ;
+	  $DataCount = 0 ;
 	  
       }
 
@@ -240,22 +247,26 @@ sub encode {
       $FlowSetPayloads{$FlowPackRef->{SetId}} .= 
 	  $FlowPackRef->{Pack} ;
 
+      $DataCount += 1 
+	if $FlowPackRef->{SetId} >= MinDataSetId ;
+
       $FlowCount += 1 ;
 
   }
 
   if( $FlowCount > 0 ){
 
-      push( 
-	    @Payloads,
-	    &datagram_encode(
-			     $HeaderRef,
-			     \%FlowSetPayloads,
-			     \$FlowCount,
-			     $#Payloads+1 
-			     )
-	    ) ;
-
+    push( 
+	 @Payloads,
+	 &datagram_encode(
+			  $HeaderRef,
+			  \%FlowSetPayloads,
+			  \$FlowCount,
+			  $#Payloads+1,
+			  \$DataCount
+			 )
+	) ;
+    
   }
 
   return (
@@ -333,7 +344,7 @@ sub check_header{
 
 #################### START sub datagram_encode() ###########
 sub datagram_encode{
-    my ($HeaderRef,$FlowSetPayloadRef,$FlowCountRef,$Count) = @_ ;
+    my ($HeaderRef,$FlowSetPayloadRef,$FlowCountRef,$PayCount,$DataCountRef) = @_ ;
     my $Payload = undef ;
     my %Padding = () ;
 
@@ -341,7 +352,7 @@ sub datagram_encode{
     # encode flow set data
     #
 
-    foreach my $SetId ( keys %{$FlowSetPayloadRef}  ){
+    foreach my $SetId ( sort { $a <=> $b } ( keys %{$FlowSetPayloadRef} ) ){
 
 	#
 	# make padding part
@@ -371,7 +382,7 @@ sub datagram_encode{
 
     if( $HeaderRef->{VersionNum} == NetFlowv9 ){
 
-	$HeaderRef->{SequenceNum} += $Count ;
+	$HeaderRef->{SequenceNum} += $PayCount ;
 	$HeaderRef->{Count}        = $$FlowCountRef ;
 
 	$Payload = 
@@ -387,7 +398,7 @@ sub datagram_encode{
     
     }elsif( $HeaderRef->{VersionNum} == IPFIX ){
 
-	$HeaderRef->{SequenceNum} += $Count ;
+	$HeaderRef->{SequenceNum} += $$DataCountRef ;
 
 	$Payload = 
 	    pack(
@@ -419,35 +430,101 @@ sub flow_encode{
     $FlowData{SetId} = $DecodeTemplateRef->{TemplateId} ;
 
     foreach my $TemplateArrayRef ( @{$DecodeTemplateRef->{Template}} ){
+
+	my $FlowValue = undef ;
+	
 	$Count{$TemplateArrayRef->{Id}} = 0 
 	    unless defined $Count{$TemplateArrayRef->{Id}} ;
 
+
 	if( defined $FlowRef->{$TemplateArrayRef->{Id}} ){
 
-	    if( ref $FlowRef->{$TemplateArrayRef->{Id}} ){
-		
-		$FlowData{Pack}  .= 
-		    pack( "A$TemplateArrayRef->{Length}",
-			 @{$FlowRef->{$TemplateArrayRef->{Id}}}[$Count{$TemplateArrayRef->{Id}}] ) ;
+	    #
+	    # One Template has multiple same Ids. 
+	    #
 
+	    if( ref $FlowRef->{$TemplateArrayRef->{Id}} ){
+
+		$FlowValue = 
+		  @{$FlowRef->{$TemplateArrayRef->{Id}}}[$Count{$TemplateArrayRef->{Id}}] ;
+
+	    #
+	    # Each Id is different than others. 
+	    # 
+
+	    }else{
+		
+		$FlowValue = $FlowRef->{$TemplateArrayRef->{Id}} ;
+
+	    }
+
+	    #
+	    # Variable Length Type
+	    # 
+		
+	    if( $TemplateArrayRef->{Length} == VariableLength ){
+
+		my $Length = length( $FlowValue ) ;
+		
+		#
+		# Value Length  < 255
+		#
+ 
+		if( $Length < ShortVariableLength ){
+		    
+		    $FlowData{Pack}  .= 
+			pack("C A$Length", 
+			     $Length, 
+			     $FlowValue ) ;
+
+		    #
+		    # Value Length > 255
+		    #
+			
+		}else{
+		    
+		    $FlowData{Pack}  .= 
+			pack("C n A$Length", 
+			     ShortVariableLength, 
+			     $Length, 
+			     $FlowValue ) ;
+
+		}
+
+	    #
+	    # Fixed Length Type
+	    # 
+		
 	    }else{
 
 		$FlowData{Pack}  .= 
-		    pack("A$TemplateArrayRef->{Length}", 
-			 $FlowRef->{$TemplateArrayRef->{Id}} ) ;
-	    
+		    pack( "A$TemplateArrayRef->{Length}", 
+			  $FlowValue ) ;
+		
 	    }
+
 
 	}else{
 
 	    $Error = "WARNING : NOT FIELD DATA INFORMATION ELEMENT ID=$TemplateArrayRef->{Id}" ;
 	    push( @Errors,$Error ) ;
+	    
+	    if( $TemplateArrayRef->{Length} == VariableLength ){
 
-	    $FlowData{Pack}  .=
-		pack("a$TemplateArrayRef->{Length}" ) ;
+		$FlowData{Pack}  .=
+		    pack("C",0 ) ;
+
+	    }else{
+
+		$FlowData{Pack}  .=
+		    pack("a$TemplateArrayRef->{Length}" ) ;
+
+	    }
 
 	}
+
 	$Count{$TemplateArrayRef->{Id}} += 1 ; 
+
     }
 
     return(
@@ -470,17 +547,34 @@ sub template_encode{
   # check template hash reference
   #
 
-  if( $TemplateRef->{SetId} == DataTemplateSetId ||
-     $TemplateRef->{SetId} == OptionTemplateSetId ){
+  unless( defined $TemplateRef->{TemplateId} ){
+      $Error = "ERROR : NO TEMPLATE ID" ;
+      push(@Errors,$Error) ;
+  }
 
-      unless( defined $TemplateRef->{TemplateId} ){
-	  $Error = "ERROR : NO TEMPLATE ID" ;
-	  push(@Errors,$Error) ;
+  unless( defined $TemplateRef->{SetId} ){
+      $Error = "ERROR : NO SET ID" ;
+      push(@Errors,$Error) ;
+  }
+
+  if( $HeaderRef->{VersionNum} == NetFlowv9 ){
+
+      if( $TemplateRef->{SetId} != NFWV9_DataTemplateSetId &&
+	  $TemplateRef->{SetId} != NFWV9_OptionTemplateSetId ){
+	
+	$Error = "ERROR : UNMATCH SET ID FOR NETFLOWV9 TEMPLATE=$TemplateRef->{TemplateId}" ;
+	push(@Errors,$Error) ;
+	
       }
 
-      unless( defined $TemplateRef->{SetId} ){
-	  $Error = "ERROR : NO SET ID" ;
+  }elsif( $HeaderRef->{VersionNum} == IPFIX ){
+
+      if( $TemplateRef->{SetId} != IPFIX_DataTemplateSetId &&
+	  $TemplateRef->{SetId} != IPFIX_OptionTemplateSetId ){
+
+	  $Error = "ERROR : UNMATCH SET ID FOR IPFIX TEMPLATE=$TemplateRef->{TemplateId}" ;
 	  push(@Errors,$Error) ;
+
       }
  
   }
@@ -493,61 +587,97 @@ sub template_encode{
   $TemplateData{SetId} = $TemplateRef->{SetId} ;
 
   $ScopeCount = $TemplateRef->{ScopeCount} 
-  if defined $TemplateRef->{ScopeCount}  ;
+      if defined $TemplateRef->{ScopeCount}  ;
+
+  $TemplateRef->{FieldCount} = $#{$TemplateRef->{Template}}+1 
+      unless defined $TemplateRef->{FieldCount} ;
 
   #
-  # pack data template header
+  # NetFlow v9 pack data template header
   #
-  
-  if( $TemplateRef->{SetId} == DataTemplateSetId ){
+      
+  if( $TemplateRef->{SetId} == NFWV9_DataTemplateSetId ){
+	  
+    $TemplateData{Pack} = 
+      pack(
+	   "nn", 
+	   $TemplateRef->{TemplateId},
+	   $TemplateRef->{FieldCount}
+	  ) ;
+    
+  #
+  # NetFlow v9 pack option template header
+  #
+    
+  }elsif( $TemplateRef->{SetId} == NFWV9_OptionTemplateSetId ){
 
+    $TemplateData{Pack} = 
+      pack(
+	   "nnn", 
+	   $TemplateRef->{TemplateId},
+	   $ScopeCount*4,
+	   ($#{$TemplateRef->{Template}}+1-$ScopeCount)*4,
+	  ) ;
+
+  #
+  # IPFIX pack data template header
+  #
+
+  }elsif( $TemplateRef->{SetId} == IPFIX_DataTemplateSetId ){
+
+    #
+    # Template Withdraw
+    #
+    
+    if( $TemplateRef->{FieldCount} == 0 ){
+      
       $TemplateData{Pack} = 
+	pack(
+	     "nn", 
+	     $TemplateRef->{TemplateId},
+	     0
+	    ) ;
+      
+    }else{
+	
+      $TemplateData{Pack} = 
+	pack(
+	     "nn", 
+	     $TemplateRef->{TemplateId},
+	     $TemplateRef->{FieldCount}
+	    ) ;
+      
+    }
+   
+  #
+  # IPFIX pack option template header
+  #
+ 
+  }elsif( $TemplateRef->{SetId} == IPFIX_OptionTemplateSetId ){
+      
+    #
+    # Template Withdraw
+    #
+    
+    if( $TemplateRef->{FieldCount} == 0 ){
+      
+	$TemplateData{Pack} = 
 	  pack(
 	       "nn", 
 	       $TemplateRef->{TemplateId},
-	       $#{$TemplateRef->{Template}}+1
-	       ) ;
-
-  #
-  # pack option template header
-  #
-
-  }elsif( $TemplateRef->{SetId} == OptionTemplateSetId ){
-
-      if( $HeaderRef->{VersionNum} == NetFlowv9 ){
-
-	  $TemplateData{Pack} = 
-	      pack(
-		   "nnn", 
-		   $TemplateRef->{TemplateId},
-		   $ScopeCount*4,
-		   ($#{$TemplateRef->{Template}}+1-$ScopeCount)*4,
-		   ) ;
-
-      }elsif( $HeaderRef->{VersionNum} == IPFIX ){
-
-	  $TemplateData{Pack} = 
-	      pack(
-		   "nnn", 
-		   $TemplateRef->{TemplateId},
-		   ($#{$TemplateRef->{Template}}+1-$ScopeCount),
-		   $ScopeCount,
-		   ) ;
-
+	       0
+	      ) ;
+	
+      }else{
+	
+	$TemplateData{Pack} = 
+	  pack(
+	       "nnn", 
+	       $TemplateRef->{TemplateId},
+	       ($#{$TemplateRef->{Template}}+1-$ScopeCount),
+	       $ScopeCount,
+	      ) ;
       }
-
-  }elsif( $TemplateRef->{SetId} == WithdrawDataTemplateSetId ||
-	  $TemplateRef->{SetId} == WithdrawOptionTemplateSetId ){
-
-  }else{
-
-	  $Error = "ERROR : UNMATCH SetId Template $TemplateRef->{SetId}" ;
-	  push(@Errors,$Error) ;
-
-	  return(
-		 \%TemplateData,
-	 	\@Errors
-	 	);
 
   }
 
@@ -555,37 +685,46 @@ sub template_encode{
   # pack template
   #
 
-  if( $TemplateRef->{SetId} <= OptionTemplateSetId ){ 
+  if( $TemplateRef->{FieldCount} > 0 ){
 
       foreach my $Ref ( @{$TemplateRef->{Template}}  ){
+
+	#
+	# Enterprise Num
+	#
+
+	if( $Ref->{Id}  =~ /([\d]+)\.([\d]+)/ ){
+	  
 	  $TemplateData{Pack} .= 
-	      pack(
-		   "nn", 
-		   $Ref->{Id},
-		   $Ref->{Length}
-		   ) ;
-      }
-
-  }elsif( $TemplateRef->{SetId} <= WithdrawOptionTemplateSetId ){
-
-      foreach my $Ref ( @{$TemplateRef->{Template}}  ){
+	    pack(
+		 "nnN", 
+		 $2+0x8000,
+		 $Ref->{Length},
+		 $1,
+		) ;
+	  
+	}else{
+	  
 	  $TemplateData{Pack} .= 
-	      pack(
-		   "nn", 
-		   $Ref->{TemplateId},
-		   $Ref->{FieldCount}
-		   ) ;
+	    pack(
+		 "nn", 
+		 $Ref->{Id},
+		 $Ref->{Length}
+		) ;
+	  
+	}
+	
       }
-
+      
   }
-
+  
   return(
 	 \%TemplateData,
 	 \@Errors
-	 );
-
+	);
+  
 }
-#################### END sub template_decode() #############
+#################### END sub template_encode() #############
 
 
 #################### START sub decode() ####################
@@ -650,11 +789,12 @@ sub decode {
   if( $NetFlowHeaderRef->{VersionNum} == IPFIX ){
 
       while( $OffSet < $NetFlowHeaderRef->{Length} ){
+
 	  my $DecodeTemplateRef = undef ;
 	  my $FlowRef = undef ;
 	  my $TemplateRef  = undef ;
 
-	  if( (length($$NetFlowPktRef) - $OffSet) < 8 ){
+	  if( (length($$NetFlowPktRef) - $OffSet) < 4 ){
 
 	      if( $FlowCount ne $NetFlowHeaderRef->{Count} ){
 		  $Error = "WARNING : UNMATCH FLOW COUNT" ;
@@ -679,7 +819,7 @@ sub decode {
 	  # search for template
 	  #
 
-	  if( $FlowSetHeaderRef->{SetId} >= MinDataTemplateSetId ){
+	  if( $FlowSetHeaderRef->{SetId} >= MinDataSetId ){
 
 	      ( $DecodeTemplateRef,$Error ) = 
 		  &search_template(
@@ -705,7 +845,7 @@ sub decode {
               # check word alignment
 	      #
 
-	      if( ($FlowSetHeaderRef->{Length}-($OffSet-$FlowSetOffSet)) < 8 ){
+	      if( ($FlowSetHeaderRef->{Length}-($OffSet-$FlowSetOffSet)) < 4 ){
 
 		  $OffSet = $FlowSetHeaderRef->{Length} + $FlowSetOffSet ;
 		  last ;
@@ -716,7 +856,7 @@ sub decode {
              # decode data template or option Template
 	     #
  
-	     if( $FlowSetHeaderRef->{SetId} < MinDataTemplateSetId ){ 
+	     if( $FlowSetHeaderRef->{SetId} < MinDataSetId ){ 
 
 		  ( $TemplateRef,$Error ) = 
 		      &template_decode(
@@ -781,7 +921,7 @@ sub decode {
 	  my $FlowRef = undef ;
 	  my $TemplateRef  = undef ;
 
-	  if( (length($$NetFlowPktRef) - $OffSet) < 8 ){
+	  if( (length($$NetFlowPktRef) - $OffSet) < 4 ){
 
 	      if( $FlowCount ne $NetFlowHeaderRef->{Count} ){
 		  $Error = "WARNING : UNMATCH FLOW COUNT" ;
@@ -806,7 +946,7 @@ sub decode {
 	  # search for template
 	  #
 
-	  if( $FlowSetHeaderRef->{SetId} > OptionTemplateSetId ){
+	  if( $FlowSetHeaderRef->{SetId} >= MinDataSetId ){
 
 	      ( $DecodeTemplateRef,$Error ) = 
 		  &search_template(
@@ -832,7 +972,7 @@ sub decode {
               # check word alignment
 	      #
 
-	      if( ($FlowSetHeaderRef->{Length}-($OffSet-$FlowSetOffSet)) < 8 ){
+	      if( ($FlowSetHeaderRef->{Length}-($OffSet-$FlowSetOffSet)) < 4 ){
 
 		  $OffSet = $FlowSetHeaderRef->{Length} + $FlowSetOffSet ;
 		  last ;
@@ -843,9 +983,7 @@ sub decode {
              # decode data template or option Template
 	     #
  
-	     if( $FlowSetHeaderRef->{SetId} == DataTemplateSetId ||
-
-		$FlowSetHeaderRef->{SetId} == OptionTemplateSetId ){
+	      if( $FlowSetHeaderRef->{SetId} < MinDataSetId ){
 
 		  ( $TemplateRef,$Error ) = 
 		      &template_decode(
@@ -920,7 +1058,7 @@ sub decode {
 
 	  if( defined $Error ){
 
-		push(@Errors,$Error) ;      
+		push(@Errors,$Error) ;
 		last ;
 
 	  }
@@ -972,7 +1110,7 @@ sub search_template{
     #
 
     unless( defined $DecodeTemplateRef ){
-	  $Error = "WARNING : NOT FOUND TEMPLATE = $TemplateId" ;
+	  $Error = "WARNING : NOT FOUND TEMPLATE=$TemplateId" ;
     }
 
     return(
@@ -999,24 +1137,22 @@ sub header_decode{
 
   if( $NetFlowHeader{VersionNum} == IPFIX ){
 
-      (undef,
-       $NetFlowHeader{Length},
+      ($NetFlowHeader{Length},
        $NetFlowHeader{UnixSecs},
        $NetFlowHeader{SequenceNum},
        $NetFlowHeader{ObservationDomainId}) =
-	   unpack("a$$OffSetRef nNNN", $$NetFlowPktRef);
+	   unpack("x$$OffSetRef nNNN", $$NetFlowPktRef);
 
       $$OffSetRef += 2 + 4*3;
  
   }elsif( $NetFlowHeader{VersionNum} == NetFlowv9 ){
 
-      (undef,
-       $NetFlowHeader{Count},
+      ($NetFlowHeader{Count},
        $NetFlowHeader{SysUpTime},
        $NetFlowHeader{UnixSecs},
        $NetFlowHeader{SequenceNum},
        $NetFlowHeader{SourceId}) =
-	   unpack("a$$OffSetRef nNNNN", $$NetFlowPktRef);
+	   unpack("x$$OffSetRef nNNNN", $$NetFlowPktRef);
 
       $$OffSetRef += 2 + 4*4; 
 
@@ -1025,8 +1161,7 @@ sub header_decode{
 
     my $Sampling = undef ;
 
-      (undef,
-       $NetFlowHeader{Count},
+      ($NetFlowHeader{Count},
        $NetFlowHeader{SysUpTime},
        $NetFlowHeader{UnixSecs},
        $NetFlowHeader{UnixNsecs},
@@ -1034,7 +1169,7 @@ sub header_decode{
        $NetFlowHeader{EngineType},
        $NetFlowHeader{EngineId},
        $Sampling ) =
-	   unpack("a$$OffSetRef nNNNNCCn", $$NetFlowPktRef);
+	   unpack("x$$OffSetRef nNNNNCCn", $$NetFlowPktRef);
 
     $NetFlowHeader{SamplingMode}     =   $Sampling >> 14 ;
     $NetFlowHeader{SamplingInterval} =   $Sampling & 0x3FFF ;
@@ -1058,10 +1193,9 @@ sub flowset_decode{
   my @errors = ();
   my $error = undef;
 
-  (undef,
-   $FlowSetHeader{SetId},
+  ($FlowSetHeader{SetId},
    $FlowSetHeader{Length}) =
-      unpack("a$$OffSetRef nn", $$NetFlowPktRef);
+      unpack("x$$OffSetRef nn", $$NetFlowPktRef);
 
   $$OffSetRef += 2*2 ;
 
@@ -1078,95 +1212,93 @@ sub template_decode{
   my %Template = ();
   my $error = undef;
 
+  $Template{SetId} = $FlowSetHeaderRef->{SetId} ;
+
   #
-  # decode data template 
+  # decode data template for NetFlow v9 or IPFIX
   #
 
-  if( $FlowSetHeaderRef->{SetId} == DataTemplateSetId ){
+  if( $FlowSetHeaderRef->{SetId} == NFWV9_DataTemplateSetId ||
+      $FlowSetHeaderRef->{SetId} == IPFIX_DataTemplateSetId ){
 
-      $Template{SetId} = $FlowSetHeaderRef->{SetId} ;
-
-      (undef,
-       $Template{TemplateId},
+      ($Template{TemplateId},
        $Template{FieldCount}) = 
-	   unpack("a$$OffSetRef nn", $$NetFlowPktRef);
+	   unpack("x$$OffSetRef nn", $$NetFlowPktRef);
 
       $$OffSetRef += 2*2 ;
+
+  #
+  # decode option template for IPFIX
+  #
+
+  }elsif( $FlowSetHeaderRef->{SetId} ==  IPFIX_OptionTemplateSetId ){
       
-  #
-  # decode option template
-  #
+      ($Template{TemplateId},
+       $Template{FieldCount}) = 
+	   unpack("x$$OffSetRef nn", $$NetFlowPktRef);
 
-  }elsif( $FlowSetHeaderRef->{SetId} ==  OptionTemplateSetId ){
+      $$OffSetRef += 2*2 ;
 
-      $Template{SetId} = $FlowSetHeaderRef->{SetId} ;
+      #
+      # template withdraw check
+      #
 
-      if( $$VerNumRef == IPFIX ){
-
-	  (undef,
-	   $Template{TemplateId},
-	   $Template{FieldCount},
-	   $Template{ScopeCount} ) =
-	       unpack("a$$OffSetRef nnn", $$NetFlowPktRef);
-
-	  $$OffSetRef += 2*3 ;
-
-      }elsif( $$VerNumRef == NetFlowv9 ){
-
-	  (undef,
-	   $Template{TemplateId},
-	   $Template{OptionScopeLength},
-	   $Template{OptionLength}) = 
-	       unpack("a$$OffSetRef nnn", $$NetFlowPktRef);
-
-	  $$OffSetRef += 2*3 ;
-
-	  $Template{FieldCount} =
-	      int(($Template{OptionScopeLength}+$Template{OptionLength})/4) ;
-
-	  $Template{ScopeCount} =   
-	      int(($Template{OptionScopeLength})/4) ;
+      if( $Template{FieldCount} != 0 ){
+	  
+	  ($Template{ScopeCount} ) =
+	      unpack("x$$OffSetRef n", $$NetFlowPktRef);
+	  $$OffSetRef += 2*1 ;
 
       }
 
-  }elsif( $FlowSetHeaderRef->{SetId} == WithdrawDataTemplateSetId ||
-	 $FlowSetHeaderRef->{SetId} == WithdrawOptionTemplateSetId ){
+  }elsif( $FlowSetHeaderRef->{SetId} ==  NFWV9_OptionTemplateSetId ){
 
-      $Template{FieldCount} = int(($FlowSetHeaderRef->{Length}-4)/4) ;
-
+      ($Template{TemplateId},
+       $Template{OptionScopeLength},
+       $Template{OptionLength}) = 
+	   unpack("x$$OffSetRef nnn", $$NetFlowPktRef);
+      
+      $$OffSetRef += 2*3 ;
+      
+      $Template{FieldCount} =
+	  int(($Template{OptionScopeLength}+$Template{OptionLength})/4) ;
+      
+      $Template{ScopeCount} =   
+	  int(($Template{OptionScopeLength})/4) ;
+      
   }
+
+  return (undef, 'ERROR: No fieldcount') if (!defined($Template{FieldCount}));
 
   for( my $n = 0 ; $n<$Template{FieldCount} ; $n++ ){
 
-      if( $FlowSetHeaderRef->{SetId} == DataTemplateSetId ||
-	 $FlowSetHeaderRef->{SetId} == OptionTemplateSetId ){
+      if( $FlowSetHeaderRef->{SetId} <= IPFIX_OptionTemplateSetId ){
 
-	  (undef,
-	   $Template{Template}->[$n]->{Id},
+	  ($Template{Template}->[$n]->{Id},
 	   $Template{Template}->[$n]->{Length}) = 
-	       unpack("a$$OffSetRef nn", $$NetFlowPktRef);
+	       unpack("x$$OffSetRef nn", $$NetFlowPktRef);
 	  $$OffSetRef += 2*2 ;
+
+	  #
+	  # check enterprise number
+	  #
 
 	  if( ($Template{Template}->[$n]->{Id} >> 15) == 1 ){
 
-	      (undef,
-	       $Template{Template}->[$n]->{EnterpriseNum}) =
-		   unpack("a$$OffSetRef N", $$NetFlowPktRef);
+	    $Template{Template}->[$n]->{Id}-=0x8000;
+
+	    ($Template{Template}->[$n]->{EnterpriseNum}) =
+	      unpack("x$$OffSetRef N", $$NetFlowPktRef);
+	    
+	    $Template{Template}->[$n]->{Id} 
+	      = $Template{Template}->[$n]->{EnterpriseNum}.".".
+		$Template{Template}->[$n]->{Id} ;
+
 	      $$OffSetRef += 4 ;
 
 	  }
 
-      }elsif( $FlowSetHeaderRef->{SetId} == WithdrawDataTemplateSetId ||
-	     $FlowSetHeaderRef->{SetId} == WithdrawOptionTemplateSetId ){
-
-	  (undef,
-	   $Template{Template}->[$n]->{TemplateId},
-	   $Template{Template}->[$n]->{FieldCount}) = 
-	       unpack("a$$OffSetRef nn", $$NetFlowPktRef);
-	  $$OffSetRef += 2*2 ;
-
       }
-
 
   }
 
@@ -1182,38 +1314,77 @@ sub template_decode{
 sub flow_decode{
   my ($NetFlowPktRef,$OffSetRef,$TemplateRef) = @_;
   my %Flow =() ;
-  my $error = undef;
+  my $error = undef ;
+  my $Length = undef ;
 
   if( defined $TemplateRef->{TemplateId} ){
-
-      $Flow{SetId} = $TemplateRef->{TemplateId} ;
+    
+    $Flow{SetId} = $TemplateRef->{TemplateId} ;
 
   }else{
 
-      $error = "ERROR: NOT FOUND TEMPLATE ID" ; 
-
+    $error = "ERROR: NOT FOUND TEMPLATE ID" ; 
+    
   }
 	
   foreach my $ref ( @{$TemplateRef->{Template}}  ){
       
-      if( defined $Flow{$ref->{Id}} ){
+    #
+    # Variable Length Type
+    #
 
-	      my (undef, $Value ) =
-		  unpack("a$$OffSetRef a$ref->{Length}",$$NetFlowPktRef);
+    if( $ref->{Length} == VariableLength ){
 
-	      $Flow{$ref->{Id}} = [ $Flow{$ref->{Id}} ] unless ref $Flow{$ref->{Id}} ;
+      $Length = 
+	unpack("x$$OffSetRef C",$$NetFlowPktRef) ;
 
-	      push( @{$Flow{$ref->{Id}}}, $Value ) ;
-	      
-      }else{
+      $$OffSetRef += 1 ;
 
-	  (undef, $Flow{$ref->{Id}} ) = 
-	      unpack("a$$OffSetRef a$ref->{Length}",$$NetFlowPktRef); 
+      if( $Length == 255 ){
+	
+	$Length = 
+	  unpack("x$$OffSetRef n",$$NetFlowPktRef) ;
+
+	$$OffSetRef += 2 ;
 
       }
 
-      $$OffSetRef += $ref->{Length} ;
+    #
+    # Fixed Length Type
+    #
 
+    }else{
+
+      $Length = $ref->{Length} ;
+
+    }
+
+    #
+    # One Template has multiple same Ids.
+    #
+
+    if( defined $Flow{$ref->{Id}} ){
+
+      my $Value =
+	unpack("x$$OffSetRef a$Length",$$NetFlowPktRef);
+      
+      $Flow{$ref->{Id}} = [ $Flow{$ref->{Id}} ] unless ref $Flow{$ref->{Id}} ;
+      
+      push( @{$Flow{$ref->{Id}}}, $Value ) ;
+
+    #
+    # Each Id is different than others.
+    #
+      
+    }else{
+
+      $Flow{$ref->{Id}} = 
+	unpack("x$$OffSetRef a$Length",$$NetFlowPktRef); 
+      
+    }
+
+    $$OffSetRef += $Length ;
+    
   }
 
   return( 
@@ -1251,8 +1422,10 @@ The following script simply outputs the received Flow Records after decoding Net
     my $sock = IO::Socket::INET->new( LocalPort =>$receive_port, Proto => 'udp') ;
 
     while ($sock->recv($packet,1548)) {
-        my (
-            $HeaderHashRef,
+
+        my ($HeaderHashRef,$FlowArrayRef,$ErrorsArrayRef)=() ;
+
+          ( $HeaderHashRef,
             $TemplateArrayRef,
             $FlowArrayRef,
             $ErrorsArrayRef)
@@ -1276,12 +1449,12 @@ The following script simply outputs the received Flow Records after decoding Net
                     printf "  %s = \n",$TempKey ;
                     foreach my $Ref ( @{$TemplateRef->{Template}}  ){
                         foreach my $Key ( keys %{$Ref} ){
-                            printf "   %s=%03d", $Key, $Ref->{$Key} ;
+                            printf "   %s=%s", $Key, $Ref->{$Key} ;
                         }
                         print "\n" ;
                     }
                 }else{
-		    printf "  %s = %3d\n", $TempKey, $TemplateRef->{$TempKey} ;
+		    printf "  %s = %s\n", $TempKey, $TemplateRef->{$TempKey} ;
                 }
             }
         }
@@ -1290,15 +1463,19 @@ The following script simply outputs the received Flow Records after decoding Net
             print "\n-- Flow Information --\n" ;
 
             foreach my $Id ( sort keys %{$FlowRef} ){
-                if( $Id eq "SetId" ){
-                    print "  $Id=$FlowRef->{$Id}\n" ;
-                }else{
-                    printf "  Id=%03d Value=%s\n",$Id,,unpack("H*",$FlowRef->{$Id}) ;
-                }
+               if( $Id eq "SetId" ){
+                   print "  $Id=$FlowRef->{$Id}\n" if defined $FlowRef->{$Id} ;
+               }elsif( ref $FlowRef->{$Id} ){
+                   printf "  Id=%s Value=",$Id ;
+                   foreach my $Value ( @{$FlowRef->{$Id}} ){
+                      printf "%s,",unpack("H*",$Value) ;
+                   }
+                   print "\n" ;
+               }else{
+                   printf "  Id=%s Value=%s\n",$Id,unpack("H*",$FlowRef->{$Id}) ;
             }
         }
     }
-
 
 =head2 EXAMPLE#2 - Convert Protocol from NetFlow v5 to NetFlow v9 -
 
@@ -1326,7 +1503,7 @@ The following script converts NetFlow protocol from NetFlow v5 to NetFlow v9 as 
                      { 'Length' => 1, 'Id' => 4  }, # PROT
                      { 'Length' => 1, 'Id' => 5  }, # TOS
                      { 'Length' => 4, 'Id' => 34 }, # SAMPLING_INT
-                     { 'Length' => 1, 'Id' => 35 }, # SAMPLING_ALG
+                     { 'Length' => 4, 'Id' => 35 }, # SAMPLING_ALG
                      ],
         } ;
 
@@ -1370,7 +1547,6 @@ The following script converts NetFlow protocol from NetFlow v5 to NetFlow v9 as 
 
         $EncodeHeaderHashRef->{"SysUpTime"}    = $HeaderHashRef->{"SysUpTime"} ;
         $EncodeHeaderHashRef->{"UnixSecs"}     = $HeaderHashRef->{"UnixSecs"} ;
-        $EncodeHeaderHashRef->{"SequenceNum"} += 1 ;
 
         ( $EncodeHeaderHashRef,
          $PktsArrayRef,
@@ -1392,8 +1568,7 @@ The following script converts NetFlow protocol from NetFlow v5 to NetFlow v9 as 
 
 =head1 DESCRIPTION
 
-The Flow module provides the decoding function for NetFlow version 5,9 and IPFIX, and the encoding function for NetFlow version 9 and IPFIX. It supports NetFlow version 9 (RFC3945) and NetFlow version 5 (http://www.cisco.com/) and IPFIX(draft-ietf-ipfix-protocol-26.txt). Regretfully, it doesn't provide the full specification of IPFIX, yet. It is future work.
-You can easily make the Flow Proxy, Protocol Converter and Flow Concentrator by using the combination of both function. And also, you can make the flexible Collector which can receive any Templates by using the Storable perl module.
+The Flow module provides the decoding function for NetFlow version 5,9 and IPFIX, and the encoding function for NetFlow version 9 and IPFIX. It supports NetFlow version 9 (RFC3945) and NetFlow version 5 (http://www.cisco.com/) and IPFIX(RFC5101). You can easily make the Flow Proxy, Protocol Converter and Flow Concentrator by using the combination of both function, just like Flow Mediator(draft-kobayashi-ipfix-mediator-model-02.txt). The Mediator would have multiple functions by utilizing intermediate process. And also, you can make the flexible Collector which can receive any Templates by using the Storable perl module.
 
 =head1 FUNCTIONS
 
@@ -1470,26 +1645,28 @@ A HASH reference containing information in case of Option Template, with the fol
 
 In case of IPFIX, "OptionScopeLength" and "OptionLength" are omitted.
 
-A HASH reference containing information in case of WithdrawTemplateMessage, with the following keys:
+In case of IPFIX, 0 value  of "FieldCount" has a particular meaning. if TemplateWithdrawMessage is received, "FieldCount" of corresponding Template would become value of 0. A HASH reference containing information in case of WithdrawTemplateMessage, with the following keys:
 
   "SetId"
   "FieldCount"
-  "Template"
+  "TemplateId"
 
 All values for above keys other than "Template" are shown as decimal. The value for "Template" is a ARRAY references. Each ARRAY element contains a HASH reference for one pair of "Id" and "Length". This pair of "Id" and "Length" are shown as Field type. The order of this ARRAY means the order of this Template to decode data. A HASH reference containing information for each field type, with the following keys:  
 
   "Id"
   "Length"
-  "EnterpriseNum"  
 
-"EnterpriseNum" is given if the value is present in the packets.
-And also, in case of Withdraw Template Message, this pair of "Id" and "Length" is replaced by the pair of "TemplateId" and "FieldCount".
+If Enterprise Number is given in the IPFIX packets, the value of "Id" is presented by concatenating string between the value of Enterprise Number and the value of Information Element Id. For example, if Enterprise Number is "3000" and Information Element Id is "100", the value of "Id" becomes "3000.100". In case of IPFIX, 65535 value  of "Length" has a particular meaning. if "Length" is 65535, this field type means valiable length field. The length of field in each Flow Record is different.
 
-The values for "Id","Length","TemplateId","FieldCount" are shown as decimal.
+The values for "Length","TemplateId","FieldCount" are shown as decimal.
 
 =item I<$FlowArrayRef>
 
-This ARRAY reference contains several HASH references for each Flow Record. This HASH reference provides Flow Record for Data Template and Option Template, as follows. A HASH reference contains "SetId" and Ids of Field type, as HASH key. The value for "SetId" is shown as decimal which means decoded TemplateId. The Id number means Field type. The value for "SetId" is shown as decimal. The value for Id number is shown as binary data. The value of each field is directly extracted from NetFlow/IPFIX packets without modification. 
+This ARRAY reference contains several HASH references for each Flow Record. This HASH reference provides Flow Record for Data Template and Option Template, as follows. A HASH reference contains "SetId" and Ids of Field type, as HASH key. The value for "SetId" is shown as decimal which means decoded TemplateId. The "Id" number means Field type. The value for "SetId" is shown as decimal. The value for "Id" number is shown as binary data. The value of each field is directly extracted from NetFlow/IPFIX packets without modification.
+
+  "SetId"
+  "Id"
+ 
 If one Flow Record has multiple Fields of same type, the value for Id number becomes a ARRAY references. Each ARRAY element is value shown as binary data. The order of this ARRAY means the order of multiple same Fields in one Flow Record. 
 
 =back
@@ -1523,17 +1700,17 @@ This ARRAY reference contains several SCALAR references for each NetFlow datagra
 
 Atsushi Kobayashi <akoba@nttv6.net>
 
+Let me know your flow-based measurement system using Net::Flow. 
+
 =head1 ACKNOWLEDGMENTS
 
-This perl module was supported by the Ministry of Internal Affairs and Communications of Japan.
+This perl module was supported by the Ministry of Internal Affairs and Communications of Japan. 
+In the considerations of variable length fields, I have received support from Philip Gladstone. 
 
 =head1 COPYRIGHT
 
-Copyright (c) 2007 NTT Information Sharing Platform Laboratories
+Copyright (c) 2007-2008 NTT Information Sharing Platform Laboratories
 
-This package is free software and is provided "as is" without express
-or implied warranty.  It may be used, redistributed and/or modified
-under the terms of the Perl Artistic License (see
-http://www.perl.com/perl/misc/Artistic.html)
+This package is free software and is provided "as is" without express or implied warranty.  It may be used, redistributed and/or modified under the terms of the Perl Artistic License (see http://www.perl.com/perl/misc/Artistic.html)
 
 =cut

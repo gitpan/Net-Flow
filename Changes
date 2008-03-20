@@ -1,6 +1,8 @@
 Revision history for Perl extension Net::Flow.
 
-0.01  Wed Nov 21 19:11:26 2007
-	- original version; created by h2xs 1.23 with options
-		-AX -n Net::Flow
+0.03  Fri Mar 21 02:27:08 2008
+	- It supports IPFIX Variable Length Type Field.
+	- It supports IPFIX Enterprise Information Element Type Field.
+	- It supports IPFIX Template Withdraw.
+
 
