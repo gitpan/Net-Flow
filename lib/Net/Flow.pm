@@ -7,7 +7,7 @@
 # This module was supported by the Ministry of Internal Affairs and 
 # Communications of Japan.
 #
-# Flow.pm - 2008/03/18
+# Flow.pm - 2008/12/04
 #
 # Copyright (c) 2007-2008 NTT Information Sharing Platform Laboratories
 #
@@ -26,7 +26,7 @@ use warnings;
 use Exporter;
 
 our @EXPORT_OK = qw(decode encode);
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 use constant NetFlowv5                        => 5 ;
 use constant NetFlowv8                        => 8 ;
@@ -1251,6 +1251,10 @@ sub template_decode{
 
       }
 
+  #
+  # decode option template for NetFlow v9
+  #
+
   }elsif( $FlowSetHeaderRef->{SetId} ==  NFWV9_OptionTemplateSetId ){
 
       ($Template{TemplateId},
@@ -1283,18 +1287,22 @@ sub template_decode{
 	  # check enterprise number
 	  #
 
-	  if( ($Template{Template}->[$n]->{Id} >> 15) == 1 ){
+	  if( $$VerNumRef >= 10 ){
 
-	    $Template{Template}->[$n]->{Id}-=0x8000;
+	      if( ($Template{Template}->[$n]->{Id} >> 15) == 1 ){
 
-	    ($Template{Template}->[$n]->{EnterpriseNum}) =
-	      unpack("x$$OffSetRef N", $$NetFlowPktRef);
+		  $Template{Template}->[$n]->{Id}-=0x8000;
+
+		  ($Template{Template}->[$n]->{EnterpriseNum}) =
+		      unpack("x$$OffSetRef N", $$NetFlowPktRef);
 	    
-	    $Template{Template}->[$n]->{Id} 
-	      = $Template{Template}->[$n]->{EnterpriseNum}.".".
-		$Template{Template}->[$n]->{Id} ;
+		  $Template{Template}->[$n]->{Id} 
+		  = $Template{Template}->[$n]->{EnterpriseNum}.".".
+		      $Template{Template}->[$n]->{Id} ;
 
-	      $$OffSetRef += 4 ;
+		  $$OffSetRef += 4 ;
+
+	      }
 
 	  }
 
@@ -1699,6 +1707,7 @@ This ARRAY reference contains several SCALAR references for each NetFlow datagra
 =head1 AUTHOR
 
 Atsushi Kobayashi <akoba@nttv6.net>
+http://www3.plala.or.jp/akoba/
 
 Let me know your flow-based measurement system using Net::Flow. 
 
