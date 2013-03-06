@@ -1,8 +1,9 @@
 Changes
+lib/Net/Flow.pm
+LICENSE
 Makefile.PL
 MANIFEST
+META.yml			Module meta-data (added by MakeMaker)
 README
 t/Net-Flow.t
-lib/Net/Flow.pm
-META.yml                                 Module meta-data (added by MakeMaker)
 META.json                                Module JSON meta-data (added by MakeMaker)
